@@ -249,3 +249,24 @@ Available via `tracepoint:binder:*`:
 | `binderfs.c` | Virtual FS for per-namespace binder devices |
 | `dbitmap.h` | Descriptor bitmap for ref handle allocation |
 | `tests/binder_alloc_kunit.c` | KUnit tests for allocator |
+
+---
+
+## HackMD Export
+
+Title: **Linux Kernel Android Binder IPC Subsystem**
+
+To publish: copy this file to [HackMD](https://hackmd.io) or use the API:
+```bash
+curl -X POST https://api.hackmd.io/v1/notes \
+  -H "Authorization: Bearer $HACKMD_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"title\":\"Linux Kernel Android Binder IPC Subsystem\",\"content\":$(cat README.md | jq -Rs .)}"
+```
+
+---
+
+## Test Cases
+
+See [`binder_trace_test.py`](binder_trace_test.py) in this directory for
+bpftrace-based step-by-step verification of the binder IPC transaction flow.
