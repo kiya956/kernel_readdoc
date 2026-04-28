@@ -594,12 +594,12 @@ def step12_gem_close(fd: int, handle: int) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    global PROBE_TIMEOUT
     parser = argparse.ArgumentParser(description="nouveau bpftrace workflow test")
     parser.add_argument("--dev",     default=DRM_DEV_DEFAULT)
     parser.add_argument("--timeout", type=int, default=PROBE_TIMEOUT)
     args = parser.parse_args()
 
-    global PROBE_TIMEOUT
     PROBE_TIMEOUT = args.timeout
 
     print(f"""
