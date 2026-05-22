@@ -1,6 +1,7 @@
 # DRM DP MST Topology — Full Initialization Flow
 
-> **Source tree:** `drivers/gpu/drm/display/drm_dp_mst_topology.c`, `drivers/gpu/drm/i915/display/intel_dp*.c`
+> **Source tree:** `drivers/gpu/drm/display/drm_dp_mst_topology.c`, `drivers/gpu/drm/i915/display/intel_dp*.c`,
+> `drivers/usb/typec/altmodes/displayport.c`, `drivers/usb/typec/tcpm/tcpm.c`
 > **Kernel:** noble-linux-oem
 > **Date:** 2026-05-22
 > **Scanned from:** ~/canonical/kernel/noble-linux-oem
@@ -9,6 +10,7 @@
 
 ## Table of Contents
 
+0. [USB-C DP Alt Mode Negotiation (Phase 0)](#0-usb-c-dp-alt-mode-negotiation-phase-0)
 1. [Unified Flow: HPD → DPCD → DSC/FEC → Training → MST Topology → Pixels](#1-unified-flow)
 2. [Key Data Structures](#2-key-data-structures)
 3. [Phase 1: Hotplug Detection & DPCD Read](#3-phase-1-hotplug-detection--dpcd-read)
@@ -18,6 +20,175 @@
 7. [Phase 5: Atomic Commit — Training, FEC, Payloads, Pixels](#7-phase-5-atomic-commit--training-fec-payloads-pixels)
 8. [Topology Maintenance (HPD IRQ)](#8-topology-maintenance-hpd-irq)
 9. [Refcounting Model](#9-refcounting-model)
+10. [Appendix: DP AUX Channel](#10-appendix-dp-aux-channel)
+
+---
+
+## 0. USB-C DP Alt Mode Negotiation (Phase 0)
+
+When connecting a display via USB-C (including USB-C to HDMI adapters), the
+connection starts as plain USB. DP Alt Mode is negotiated over the USB-C CC
+(Configuration Channel) pins using USB Power Delivery VDM messages — this
+happens **before** any DP signaling exists.
+
+### USB-C Connector Pin Roles
+
+```
+USB-C Connector: 24 pins
+━━━━━━━━━━━━━━━━━━━━━━━━
+  CC1, CC2          ← Configuration Channel (orientation detect, PD messaging)
+  TX1+/-, RX1+/-    ← SuperSpeed lane pair 1 (USB 3.x or DP lanes)
+  TX2+/-, RX2+/-    ← SuperSpeed lane pair 2 (USB 3.x or DP lanes)
+  D+, D-            ← USB 2.0 (always stays USB, never reassigned)
+  VBUS, GND         ← Power
+  SBU1, SBU2        ← Sideband Use (become AUX CH+/- in DP Alt Mode)
+```
+
+### Negotiation Flow
+
+```
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Step 0: Cable Plugged In — Everything is USB                   │
+ │                                                                  │
+ │  CC pins detect cable presence + orientation                    │
+ │  tcpm.c state: SNK_UNATTACHED → SNK_ATTACH_WAIT                │
+ │  (drivers/usb/typec/tcpm/tcpm.c:37-155)                        │
+ │                                                                  │
+ │  All SuperSpeed pairs = USB 3.x                                 │
+ │  SBU pins = unused                                              │
+ │  No DP anything yet                                             │
+ └──────────────────────────┬───────────────────────────────────────┘
+                            │ CC detects valid connection
+                            ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Step 1: USB PD Negotiation (over CC pins)                      │
+ │                                                                  │
+ │  tcpm.c: SNK_DISCOVERY → SNK_READY (or SRC_READY)              │
+ │  ├─ Exchange Source/Sink capabilities                           │
+ │  ├─ Negotiate voltage/current (5V/9V/15V/20V)                  │
+ │  └─ Establish USB data connection (USB 3.x works now)           │
+ │                                                                  │
+ │  ▲ At this point: full USB 3.x running on all SS lanes          │
+ └──────────────────────────┬───────────────────────────────────────┘
+                            │ PD contract established
+                            ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Step 2: Alt Mode Discovery (Structured VDMs over CC)           │
+ │                                                                  │
+ │  tcpm_pd_svdm()  tcpm.c:1985-2205                               │
+ │  vdm_state_machine_work()  tcpm.c:2745-2767                     │
+ │                                                                  │
+ │  ① DISCOVER_IDENTITY                                            │
+ │     → "who are you?" (get VID/PID of partner)                   │
+ │                                                                  │
+ │  ② DISCOVER_SVIDS                                               │
+ │     → "what alt modes do you support?"                          │
+ │     ← partner replies with SVID list                            │
+ │       e.g. [0xFF01 = DisplayPort, 0x8087 = Thunderbolt]         │
+ │                                                                  │
+ │  ③ DISCOVER_MODES (for SVID 0xFF01)                             │
+ │     → "what DP capabilities / pin assignments?"                 │
+ │     ← partner replies: supported pins, signaling, role          │
+ │                                                                  │
+ │  All of this is over CC pins — NOT USB data, NOT DP AUX         │
+ └──────────────────────────┬───────────────────────────────────────┘
+                            │ DP alt mode discovered
+                            ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Step 3: Enter DP Alt Mode + Configure Pins                     │
+ │                                                                  │
+ │  dp_altmode_activate()  displayport.c:497-516                   │
+ │                                                                  │
+ │  ④ ENTER_MODE (SVID=0xFF01)                                     │
+ │     → typec_altmode_enter() → "activate DP alt mode"            │
+ │     ← ACK                                                       │
+ │                                                                  │
+ │  ⑤ DP STATUS_UPDATE                                              │
+ │     → "what's your HPD state, multi-function preference?"       │
+ │     ← partner reports connection status                         │
+ │                                                                  │
+ │  ⑥ DP CONFIGURE — pin assignment selection                      │
+ │     dp_altmode_configure()  displayport.c:99-155                │
+ │                                                                  │
+ │   ┌───────────────────────────────────────────────────────────┐  │
+ │   │  Pin Assignment Options:                                  │  │
+ │   │                                                           │  │
+ │   │  Pin C: 4 DP lanes + no USB 3.x  (default, line 140)     │  │
+ │   │         maximum DP bandwidth (HBR3 × 4 = 32.4 Gbps)      │  │
+ │   │                                                           │  │
+ │   │  Pin D: 2 DP lanes + USB 3.x     (multi-function)        │  │
+ │   │         half DP bandwidth, but USB 3.x data preserved     │  │
+ │   │                                                           │  │
+ │   │  Pin E: 4 DP lanes + no USB 3.x  (different mapping)     │  │
+ │   │                                                           │  │
+ │   │  Selection logic (displayport.c:131-148):                 │  │
+ │   │    if partner prefers multi-func → Pin D                  │  │
+ │   │    else if Pin C available → Pin C (default)              │  │
+ │   │    else → whatever is mutually supported                  │  │
+ │   └───────────────────────────────────────────────────────────┘  │
+ │                                                                  │
+ │  → CONFIGURE VDM sent → USB-C mux hardware switches pins       │
+ └──────────────────────────┬───────────────────────────────────────┘
+                            │ pins physically reassigned
+                            ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Step 4: Pins Reassigned — GPU Takes Over                       │
+ │                                                                  │
+ │  BEFORE (USB mode):            AFTER (DP Alt Mode, Pin C):      │
+ │    TX1/RX1 = USB 3.x SS        TX1/RX1 = DP Main Link L0,L1   │
+ │    TX2/RX2 = USB 3.x SS        TX2/RX2 = DP Main Link L2,L3   │
+ │    SBU1/2  = unused             SBU1/2  = DP AUX CH+/CH-       │
+ │    D+/D-   = USB 2.0            D+/D-   = USB 2.0 (kept!)     │
+ │                                                                  │
+ │  AFTER (DP Alt Mode, Pin D — multi-function):                   │
+ │    TX1/RX1 = USB 3.x SS  (kept!)                               │
+ │    TX2/RX2 = DP Main Link L0,L1  (only 2 DP lanes)             │
+ │    SBU1/2  = DP AUX CH+/CH-                                    │
+ │    D+/D-   = USB 2.0            (kept!)                        │
+ │                                                                  │
+ │  i915 TC port detects DP Alt Mode:                              │
+ │    icl_tc_phy_hpd_live_status()  intel_tc.c:511-541             │
+ │    → reads PORT_TX_DFLEXDPSP → TC_LIVE_STATE_TC bit set         │
+ │    → tc->mode = TC_PORT_DP_ALT    intel_tc.c:34                │
+ │    → intel_tc_port_in_dp_alt_mode() returns true                │
+ │       intel_tc.c:108-116                                        │
+ │                                                                  │
+ │  From here: standard DP flow                                    │
+ │  → HPD detected → DPCD read via AUX (SBU pins)                 │
+ │  → Link training on main link lanes                             │
+ │  → MST topology discovery (if MST)                             │
+ │  → Pixels flow                                                  │
+ │  (see Phase 1-5 below)                                          │
+ └──────────────────────────────────────────────────────────────────┘
+```
+
+### USB-C to HDMI Adapters
+
+A USB-C to HDMI cable/adapter contains a **DP-to-HDMI protocol converter**
+chip inside. The USB-C side negotiates DP Alt Mode as above, then the adapter
+translates DP signaling to HDMI on the output. The GPU only ever speaks DP —
+it does not know about HDMI.
+
+### Channel Summary
+
+| Phase | Physical Channel | Protocol | Who's Talking |
+|-------|-----------------|----------|---------------|
+| Cable detect | CC pins | USB-C spec | PHY hardware |
+| PD negotiation | CC pins | USB PD | TCPM ↔ partner PD |
+| Alt mode discovery | CC pins | Structured VDM | TCPM ↔ partner, SVID 0xFF01 |
+| Pin reassignment | CC pins | CONFIGURE VDM | Mux hardware switches |
+| DPCD / link config | SBU pins (= AUX) | DP AUX (1 Mbps) | **GPU** ↔ display |
+| Video data | TX/RX SS lanes (= DP) | DP Main Link | **GPU** ↔ display |
+| USB 2.0 (always) | D+/D- | USB 2.0 | USB host ↔ device |
+
+### Key Source Files
+
+| File | Role |
+|------|------|
+| `drivers/usb/typec/tcpm/tcpm.c` | Type-C Port Manager: PD + VDM state machine |
+| `drivers/usb/typec/altmodes/displayport.c` | DP Alt Mode driver (SVID 0xFF01) |
+| `drivers/gpu/drm/i915/display/intel_tc.c` | i915 Type-C port mode detection |
+| `drivers/gpu/drm/i915/display/intel_dp_aux.c` | AUX transactions (over SBU pins) |
 
 ---
 
@@ -593,3 +764,50 @@ Two separate reference counts protect MST objects:
 | **FEC HW enable** | commit pre_enable (after training) | `intel_ddi_enable_fec()` |
 | **Payload program** | commit pre_enable + enable | `drm_dp_add_payload_part1/2()` |
 | **Pixels flow** | commit enable | `intel_enable_transcoder()` |
+
+---
+
+## 10. Appendix: DP AUX Channel
+
+The DP AUX (Auxiliary) channel is a dedicated low-speed sideband bus on the
+DisplayPort connector — it is **not** USB. On native DP connectors it has its
+own pins; on USB-C it reuses the SBU1/SBU2 pins after DP Alt Mode is entered.
+
+### Physical Layer
+
+```
+Native DP Connector:    AUX_CH+, AUX_CH-  (dedicated pins)
+USB-C in DP Alt Mode:   SBU1, SBU2        (repurposed as AUX_CH+/-)
+
+Speed: 1 Mbps, Manchester-encoded, half-duplex differential pair
+Max payload per transaction: 16 bytes data
+```
+
+### Transaction Types
+
+| Type | Purpose | Example |
+|------|---------|---------|
+| **Native AUX Read** | Read DPCD registers | Read receiver caps (0x0000) |
+| **Native AUX Write** | Write DPCD registers | Set link rate, lane count |
+| **I2C-over-AUX Read** | Read I2C device via AUX | Read EDID from monitor |
+| **I2C-over-AUX Write** | Write I2C device via AUX | Rare, some HDCP use |
+
+### i915 AUX Implementation
+
+```
+drm_dp_dpcd_read(aux, addr, buf, len)         DRM helper
+  └─ aux->transfer()                          vtable callback
+     = intel_dp_aux_transfer()                intel_dp_aux.c:483
+       └─ intel_dp_aux_xfer()                intel_dp_aux.c:237
+          ├─ grab AUX power domain wakeref
+          ├─ write request into GPU MMIO registers:
+          │   ch_ctl  = DP_AUX_CH_CTL         (control: start, size, timeout)
+          │   ch_data = DP_AUX_CH_DATA[0-4]   (up to 20 bytes payload)
+          ├─ kick hardware: set SEND bit
+          ├─ poll/wait for DONE bit
+          └─ read reply from ch_data registers
+```
+
+The GPU has a dedicated **AUX controller** per DP port — the driver writes
+addresses and data into MMIO registers, the controller handles Manchester
+encoding and the electrical protocol. No software bit-banging.
