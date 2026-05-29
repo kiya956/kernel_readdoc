@@ -1,0 +1,201 @@
+================================================================================
+  Thunderbolt/USB4 — Detailed tb_start() Initialization Flow
+  Source: drivers/thunderbolt/tb.c:3056  (noble-linux-oem kernel)
+  Date: 2026-05-29
+================================================================================
+
+
+tb_start(tb, reset)                                    ← tb.c:3056
+│
+│ ══════════════════════════════════════════════════════
+│ PHASE 1: Allocate Root Switch
+│ ══════════════════════════════════════════════════════
+│
+├─► tb_switch_alloc(tb, &tb->dev, route=0)             ← switch.c:2412
+│     ├─ tb_cfg_get_upstream_port(ctl, route=0)        read upstream port# via ctl
+│     ├─ kzalloc(struct tb_switch)
+│     ├─ tb_cfg_read(ctl, &sw->config, ...)            read 5 DWORDs of switch config
+│     ├─ tb_switch_get_generation(sw)                  determine TB gen (1/2/3/USB4)
+│     ├─ sw->config.depth = 0, route = 0               root is always depth 0
+│     ├─ kcalloc(max_port_number+1, tb_port)            allocate port array
+│     │    └─ for each port: ida_init(in_hopids/out_hopids)
+│     ├─ tb_switch_find_vse_cap(PLUG_EVENTS)           find vendor-specific caps
+│     ├─ tb_switch_find_vse_cap(TIME2 / TMU)
+│     ├─ tb_switch_find_vse_cap(LINK_CONTROLLER)
+│     ├─ tb_switch_find_vse_cap(CP_LP)
+│     ├─ sw->authorized = true                          root is always authorized
+│     └─ device_initialize(&sw->dev)                   init but don't register yet
+│
+│ ══════════════════════════════════════════════════════
+│ PHASE 2: Configure Root Switch
+│ ══════════════════════════════════════════════════════
+│
+├─► tb_switch_configure(sw)                            ← switch.c:2567
+│     ├─ sw->config.enabled = 1
+│     ├─ if USB4:
+│     │    ├─ set cmuv (CM version: v1 or v2)
+│     │    ├─ set plug_events_delay
+│     │    ├─ tb_sw_write(ROUTER_CS_1, 4 DWORDs)       write config to HW
+│     │    └─ usb4_switch_setup(sw)                     USB4-specific setup
+│     └─ tb_plug_events_active(sw, true)               enable plug event notifications
+│
+│ ══════════════════════════════════════════════════════
+│ PHASE 3: Register Root Switch (tb_switch_add)
+│ ══════════════════════════════════════════════════════
+│
+├─► tb_switch_add(sw)                                  ← switch.c:3250
+│     ├─ tb_switch_add_dma_port(sw)                    init DMA config port (NVM access)
+│     ├─ tb_switch_credits_init(sw)                    init credit allocation
+│     ├─ tb_drom_read(sw)                              read DROM (device ROM: vendor/model)
+│     ├─ tb_switch_set_uuid(sw)                        set unique ID
+│     ├─ for each port:
+│     │    └─ tb_init_port(port)                       ← switch.c:694
+│     │         ├─ tb_port_read(&port->config, 8 DW)   read port config from HW
+│     │         ├─ if TB_TYPE_PORT (lane adapter):
+│     │         │    ├─ find CAP_PHY → port->cap_phy
+│     │         │    ├─ find CAP_USB4 → port->cap_usb4
+│     │         │    └─ read ctl_credits from hop config
+│     │         └─ else (protocol adapter: PCIe/USB3/DP):
+│     │              └─ find CAP_ADAP → port->cap_adap
+│     ├─ tb_check_quirks(sw)
+│     ├─ tb_switch_default_link_ports(sw)              set primary/secondary links
+│     ├─ tb_switch_update_link_attributes(sw)          read link width/speed
+│     ├─ tb_switch_link_init(sw)                       init link state
+│     ├─ tb_switch_clx_init(sw)                        init CL power states
+│     ├─ tb_switch_tmu_init(sw)                        init TMU config
+│     ├─ tb_switch_port_hotplug_enable(sw)             enable hotplug on ports
+│     ├─ device_add(&sw->dev)                          ★ register on tb_bus → sysfs
+│     ├─ usb4_switch_add_ports(sw)                     register USB4 port devices
+│     ├─ tb_switch_nvm_add(sw)                         expose NVM via nvmem
+│     └─ pm_runtime_enable (if rpm supported)
+│
+│ ══════════════════════════════════════════════════════
+│ PHASE 4: TMU Setup
+│ ══════════════════════════════════════════════════════
+│
+├─ tb_switch_tmu_configure(root, TMU_MODE_LOWRES)      set low-resolution timer mode
+├─ tb_switch_tmu_enable(root)                          enable TMU for time sync
+│
+│ ══════════════════════════════════════════════════════
+│ PHASE 5: Discovery (if !reset or pre-USB4)
+│ ══════════════════════════════════════════════════════
+│
+├─ if reset && USB4:
+│    ├─ discover = false                               skip discovery, treat as fresh
+│    └─ tb_switch_reset(root) (if USB4 v1 only)        reset all ports
+│
+├─ if discover:
+│    │
+│    ├─► tb_scan_switch(root)                          ← tb.c:1286
+│    │     └─ for each port on root:
+│    │          └─► tb_scan_port(port)                 ← tb.c:1302
+│    │               ├─ skip upstream ports, non-lane ports
+│    │               ├─ tb_wait_for_port(port)          wait for link up
+│    │               ├─ tb_switch_alloc(downstream_route)  alloc child switch
+│    │               ├─ tb_switch_configure(child)      configure child
+│    │               ├─ tb_switch_add(child)            register child
+│    │               ├─ tb_configure_link(port, upstream) connect port↔remote
+│    │               ├─ tb_retimer_scan(port)           find retimers on link
+│    │               ├─ tb_enable_clx(child)            enable CL0s/CL1
+│    │               ├─ tb_enable_tmu(child)            enable TMU
+│    │               ├─ tb_switch_configuration_valid(child)
+│    │               └─ tb_scan_switch(child)           ★ RECURSE into child
+│    │
+│    ├─► tb_discover_tunnels(tb)                       ← tb.c:1707
+│    │     └─ tb_switch_discover_tunnels(root, list)   ← tb.c:399
+│    │          ├─ for each port on switch:
+│    │          │    ├─ DP_HDMI_IN  → tb_tunnel_discover_dp()
+│    │          │    ├─ PCIE_DOWN   → tb_tunnel_discover_pci()
+│    │          │    └─ USB3_DOWN   → tb_tunnel_discover_usb3()
+│    │          └─ RECURSE into remote switches
+│    │
+│    └─► tb_discover_dp_resources(tb)                  ← tb.c:193
+│          └─ for each discovered DP tunnel:
+│               add dst_port to dp_resources list
+│
+│ ══════════════════════════════════════════════════════
+│ PHASE 6: Create Missing Tunnels & Finalize
+│ ══════════════════════════════════════════════════════
+│
+├─► tb_create_usb3_tunnels(root)                       ← tb.c:1014
+│     ├─ if tb_route(sw) != 0: tb_tunnel_usb3(sw)     create tunnel for this switch
+│     └─ RECURSE into each remote child switch
+│
+├─ tb_add_dp_resources(root)                           add DP IN adapters to resource list
+├─ tb_switch_enter_redrive(root)                       enable GPU redrive mode
+├─ device_for_each_child → tb_scan_finalize_switch     unsuppress uevents for sysfs
+│
+└─ tcm->hotplug_active = true                          ★ enable runtime hotplug handling
+
+
+================================================================================
+  Key Data Structures
+================================================================================
+
+  struct tb (domain)
+    └─ root_switch ──► struct tb_switch
+                         ├─ ports[] ──► struct tb_port [0..max_port_number]
+                         │               ├─ port 0: control (NHI / internal)
+                         │               ├─ port 1: lane adapter ──→ remote ──→ child port 1
+                         │               ├─ port 3: PCIE_DOWN   ┐
+                         │               ├─ port 5: DP_HDMI_IN  ├ protocol adapters
+                         │               └─ port 6: USB3_DOWN   ┘
+                         │
+                         └─ child (via port->remote->sw)
+                              └─ struct tb_switch
+                                   └─ ports[]
+                                        ├─ port 1: lane adapter (upstream)
+                                        ├─ port 3: PCIE_UP
+                                        ├─ port 4: DP_HDMI_OUT
+                                        └─ port 5: USB3_UP
+
+
+================================================================================
+  Port Types (tb_regs.h)
+================================================================================
+
+  Type               Code        Role
+  ─────────────────  ──────────  ──────────────────────────
+  TB_TYPE_NHI        0x000002    NHI control adapter
+  TB_TYPE_PORT       0x000001    Lane adapter (PHY link)
+  TB_TYPE_PCIE_DOWN  0x100101    PCIe downstream adapter
+  TB_TYPE_PCIE_UP    0x100102    PCIe upstream adapter
+  TB_TYPE_USB3_DOWN  0x200101    USB3 downstream adapter
+  TB_TYPE_USB3_UP    0x200102    USB3 upstream adapter
+  TB_TYPE_DP_HDMI_IN 0x0e0101    DP source (IN) adapter
+  TB_TYPE_DP_HDMI_OUT 0x0e0102   DP sink (OUT) adapter
+
+
+================================================================================
+  Tunnel Paths (how adapters connect across switches)
+================================================================================
+
+  PCIe tunnel:   PCIE_DOWN (host) ═══► lane ═══► PCIE_UP (device)
+  USB3 tunnel:   USB3_DOWN (host) ═══► lane ═══► USB3_UP (device)
+  DP tunnel:     DP_HDMI_IN (host) ══► lane ═══► DP_HDMI_OUT (device)
+
+
+================================================================================
+  Notes
+================================================================================
+
+  1. Alloc → Configure → Add is the 3-step lifecycle for every switch.
+     Alloc reads HW config, Configure writes enumeration back, Add
+     initializes ports/credits/DROM and registers the device.
+
+  2. Discovery is recursive — tb_scan_switch → tb_scan_port →
+     tb_scan_switch walks the entire daisy-chain topology depth-first.
+
+  3. Tunnel discovery vs creation — first discover what the boot firmware
+     already set up (PCIe/DP/USB3 tunnels), then create any missing USB3
+     tunnels. This avoids duplicating existing tunnels.
+
+  4. Discovery is skipped when reset=true on USB4 — everything is treated
+     as fresh hotplug events after the router is reset.
+
+  5. tb_init_port does NOT add DP/PCIe/USB3 resources. It only reads HW
+     capabilities (port type, credits, cap offsets). Tunnel resources are
+     wired up later during discover/create phases.
+
+  6. dp_resources list contains available DP IN adapter ports (struct tb_port)
+     — not switches. PCIe and USB3 tunnels don't use this resource list.
