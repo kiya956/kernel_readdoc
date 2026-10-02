@@ -399,21 +399,7 @@ enum fb_op_origin {
         ORIGIN_DIRTYFB,     /* line 39 */
         ORIGIN_CURSOR_UPDATE, /* line 40 */
 };
-```
 
-| You said | Correct identifier in this tree | Where defined |
-| --- | --- | --- |
-| `ORIGIN_CS` | ✅ `ORIGIN_CS` — correct | `intel_frontbuffer.h:37` |
-| `ORIGIN_PAGEFLIP` | ❌ → **`ORIGIN_FLIP`** | `intel_frontbuffer.h:38` |
-| `ORIGIN_DBDIRTY` | ❌ → **`ORIGIN_DIRTYFB`** | `intel_frontbuffer.h:39` |
-
-A tree-wide grep for `ORIGIN_PAGEFLIP` and `ORIGIN_DBDIRTY` under `drivers/gpu/drm/`
-returns zero hits. The two remaining real origins that you did not mention are
-`ORIGIN_CPU` (CPU/GTT/WC domain writes, e.g. `i915_gem_domain.c:71,650,762`,
-`i915_gem.c:582,629,717`, `intel_fbdev.c:80`) and `ORIGIN_CURSOR_UPDATE`
-(legacy cursor fast path, `intel_cursor.c:890-891`).
-
----
 
 ### 1. The common core: what every origin funnels into
 
