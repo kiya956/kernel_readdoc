@@ -384,23 +384,6 @@ Runtime PM
 
 ---
 
-### 0. Terminology correction (important)
-
-You asked about `ORIGIN_CS`, `ORIGIN_PAGEFLIP` and `ORIGIN_DBDIRTY`. Two of those three
-names do **not** exist in this tree. The actual enum is:
-
-`drivers/gpu/drm/i915/display/intel_frontbuffer.h:35-41`
-
-```c
-enum fb_op_origin {
-        ORIGIN_CPU = 0,     /* line 36 */
-        ORIGIN_CS,          /* line 37 */
-        ORIGIN_FLIP,        /* line 38 */
-        ORIGIN_DIRTYFB,     /* line 39 */
-        ORIGIN_CURSOR_UPDATE, /* line 40 */
-};
-
-
 ### 1. The common core: what every origin funnels into
 
 All three paths converge on a tiny set of functions in
