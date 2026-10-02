@@ -221,16 +221,94 @@ intel_display
   └─ intel_cdclk        (display clock management)
 ```
 
-Atomic commit path:
+Atomic commit path (line numbers: `drivers/gpu/drm/i915/display/intel_display.c`, v7.2-rc1):
 ```
-intel_atomic_commit()
-  ├─ intel_atomic_check()     — validate pipe bandwidth, clocks
-  ├─ intel_atomic_prepare_commit()
+intel_atomic_check()  — .atomic_check vtable, runs in the ioctl before
+                        commit; validates pipe bandwidth, clocks        :6402
+                        (wired at intel_display_driver.c:103)
+
+intel_atomic_commit()  — .atomic_commit vtable (driver.c:104)             :7707
+  ├─ intel_atomic_prepare_commit()                                        :7743
   │    └─ intel_prepare_plane_fb() — pin framebuffer
-  └─ intel_atomic_commit_tail()
-       ├─ intel_update_crtc()  — program display registers
-       └─ intel_wait_for_vblank() → drm_handle_vblank()
+  └─ intel_atomic_commit_tail()                                           :7423
+       ├─ intel_atomic_dsb_prepare() / _finish()  — build DSB batch  :7433/:7445
+       ├─ intel_commit_modeset_disables()   (direct call at :7486)        :6908
+       │    └─ intel_crtc_disable_planes()                        :6935 →  :1287
+       │         └─ intel_frontbuffer_flip(display, fb_bits)               :1312
+       │              ^^ DISABLE-SIDE notification: old planes/CRTC being
+       │                 torn down in a modeset. Runs before THIS commit's
+       │                 flip-done wait (:7553). (Earlier, :7447 still waited
+       │                 on *preceding* commits' flip_done.)
+       │
+       ├─ commit_modeset_enables  (display->modeset.funcs)                :7537
+       │    │   = intel_commit_modeset_enables()   (pre-SKL vtables)      :6978
+       │    │   = skl_commit_modeset_enables()     (SKL+ DDB-ordered)     :6999
+       │    ├─ intel_enable_crtc()                    :6987 / :7098 / :7116
+       │    ├─ intel_pre_update_crtc()                 :6988 / :7037 / :7128
+       │    │    └─ intel_crtc_planes_update_noarm()  (non-DSB/non-FlipQ) :6813
+       │    └─ intel_update_crtc()                   :6995 / :7060 / :7148 → :6816
+       │         │   *** THIS is where display registers are actually
+       │         │       programmed and plane updates are armed ***
+       │         ├─ use_flipq → intel_flipq_enable()                      :6825
+       │         │              intel_crtc_prepare_vblank_event()         :6827
+       │         │              intel_flipq_add(crtc, INTEL_FLIPQ_PLANE_1,
+       │         │                              0, INTEL_DSB_0, dsb_commit) :6829
+       │         │                 — HW flip queue executes the DSB batch
+       │         ├─ use_dsb   → intel_crtc_prepare_vblank_event()         :6832
+       │         │              intel_dsb_commit(dsb_commit)              :6834
+       │         │                 — DSB engine replays the batch (arm incl.)
+       │         └─ else (direct MMIO; vblank evasion unless do_async_flip)
+       │              ├─ intel_pipe_update_start()     intel_crtc.c:587 / :6837
+       │              ├─ intel_dsb_commit() if dsb_color                  :6840
+       │              ├─ commit_pipe_pre_planes()                         :6842
+       │              ├─ intel_crtc_planes_update_arm()  intel_plane.c:1073 / :6844
+       │              ├─ commit_pipe_post_planes()                        :6846
+       │              └─ intel_pipe_update_end()       intel_crtc.c:726 / :6848
+       │
+       ├─ intel_wait_for_vblank_workers()                                 :7542
+       ├─ drm_atomic_helper_wait_for_flip_done()                          :7553
+       │     — waits on each CRTC commit->flip_done (10 s timeout). See caveat below.
+       └─ intel_post_plane_update()                                :7593 → :1037
+            └─ intel_frontbuffer_flip(display, new_crtc_state->fb_bits)   :1047
+                 ^^ POST-PLANE-UPDATE notification: ORIGIN_FLIP flush for the
+                    affected plane bits in new_crtc_state->fb_bits, including
+                    previously visible planes, raised after the flip-done wait
+                    RETURNS (which is not the same as "HW latched").
 ```
+
+**Programming vs. notification — do not conflate the two.**
+`intel_update_crtc()` (`:6816`) is the *programming* step: it pushes plane/pipe
+registers at the hardware through one of three mechanisms (FlipQ, DSB, or direct
+MMIO with vblank evasion unless `do_async_flip`). `intel_frontbuffer_flip()` is
+only a *notification* to FBC/PSR/DRRS of frontbuffer flip/update activity; it
+does not establish that pixel content changed or program plane registers. The
+two `intel_frontbuffer_flip()` sites in the commit tail have
+different meanings:
+
+| Site | File:line | Meaning |
+| --- | --- | --- |
+| `intel_crtc_disable_planes()` | `:1312` | **Disable side.** Flushes the bits of planes that *were* visible and are being disabled as part of a modeset-disable sequence (`intel_commit_modeset_disables()` `:6908`, call site `:6935`). Runs before `commit_modeset_enables` and before this commit's flip-done wait (`:7553`) — it is not evidence that a flip completed. (`drm_atomic_helper_wait_for_dependencies()` at `:7447` has already waited on *preceding* commits' `flip_done`.) |
+| `intel_post_plane_update()` | `:1047` | **Post-plane-update side.** Raised after `intel_wait_for_vblank_workers()` (`:7542`) and `drm_atomic_helper_wait_for_flip_done()` (`:7553`) have returned, for `new_crtc_state->fb_bits`. |
+
+**Caveat: `drm_atomic_helper_wait_for_flip_done()` returning does not prove the
+hardware latched the new surface.** Three documented escapes in this tree:
+
+* it waits with `wait_for_completion_timeout(&commit->flip_done, 10 * HZ)` and, on
+  timeout, only logs `"[CRTC:%d:%s] flip_done timed out"` and continues
+  (`drivers/gpu/drm/drm_atomic_helper.c:1959-1962`);
+* for `state->legacy_cursor_update`, `drm_atomic_helper_setup_commit()` (reached via
+  `intel_atomic_setup_commit()`, `intel_display.c:7679`) does
+  `complete_all(&commit->flip_done)` up front (`drm_atomic_helper.c:2549-2553`), so
+  the wait returns immediately. i915 therefore clears `legacy_cursor_update` on
+  pre-gen9 when watermarks need a post-vblank update (`intel_display.c:7724-7741`,
+  comment: "otherwise `drm_atomic_helper_wait_for_flip_done()` is a noop and we get
+  FIFO underruns because we didn't wait for vblank");
+* CRTCs that are inactive both before and after also get `flip_done` completed up
+  front (`drm_atomic_helper.c:2544-2547`), and CRTCs with no attached commit are
+  skipped outright (`drm_atomic_helper.c:1956-1957`).
+
+So the correct statement is "the commit tail has *returned from* the flip-done
+wait", not "the flip has definitely landed in hardware".
 
 ---
 
@@ -578,17 +656,57 @@ just calls `intel_atomic_commit_tail(state)`.
 
 | Step | File:line |
 | --- | --- |
+| `intel_atomic_dsb_prepare(state, crtc)` | `:7433` |
 | `intel_atomic_commit_fence_wait(state)` | `:7435` |
 | `intel_td_flush(display)` | `:7437` |
+| `intel_atomic_dsb_finish(state, crtc)` | `:7445` |
 | `drm_atomic_helper_wait_for_dependencies()` | `:7447` |
 | power-domain `DC_OFF` get | `:7478` |
-| `commit_modeset_disables` / `commit_modeset_enables` | `:7486`, `:7537` |
+| `intel_commit_modeset_disables()` → `intel_crtc_disable_planes()` → `intel_frontbuffer_flip()` | `:7486` → `:6935`/`:1287` → `:1312` |
+| `commit_modeset_enables` → `intel_update_crtc()` (**display programming**) | `:7537` → `:6816` |
 | `intel_wait_for_vblank_workers(state)` | `:7542` |
 | `drm_atomic_helper_wait_for_flip_done()` | `:7553` |
 | optimize watermarks loop | `:7575-7587` |
 | **`intel_post_plane_update(state, crtc)`** | **`:7593`** |
 | `drm_atomic_helper_commit_hw_done()` | `:7623` |
 | `queue_work(display->wq.cleanup, &state->cleanup_work)` | `:7651` |
+
+The `commit_modeset_enables` row is a vtable call,
+`display->modeset.funcs->commit_modeset_enables(state)` (`:7537`), resolving to
+`skl_commit_modeset_enables()` (`:6999`, SKL+ vtable `:8212`) or
+`intel_commit_modeset_enables()` (`:6978`, vtables `:8221/:8230/:8239/:8248`).
+Both funnel into `intel_update_crtc()` (`:6816`, called at `:6995`, `:7060`,
+`:7148`), which is where the plane/pipe registers are actually armed, via one of
+three mechanisms:
+
+| Mechanism | Condition | Calls |
+| --- | --- | --- |
+| **FlipQ** | `new_crtc_state->use_flipq` | `intel_flipq_enable()` `:6825` → `intel_crtc_prepare_vblank_event()` `:6827` → `intel_flipq_add(crtc, INTEL_FLIPQ_PLANE_1, 0, INTEL_DSB_0, dsb_commit)` `:6829` (`intel_flipq.c:422`) |
+| **DSB** | `new_crtc_state->use_dsb` | `intel_crtc_prepare_vblank_event()` `:6832` → `intel_dsb_commit(dsb_commit)` `:6834` (`intel_dsb.c:929`) |
+| **Direct MMIO** | otherwise | `intel_pipe_update_start()` `:6837` (`intel_crtc.c:587`) → [`intel_dsb_commit()` for `dsb_color` `:6840`] → `commit_pipe_pre_planes()` `:6842` → `intel_crtc_planes_update_arm()` `:6844` (`intel_plane.c:1073`) → `commit_pipe_post_planes()` `:6846` → `intel_pipe_update_end()` `:6848` (`intel_crtc.c:726`) |
+
+For the FlipQ/DSB mechanisms the plane register writes (including
+`intel_crtc_planes_update_arm()`) were pre-recorded into `dsb_commit` by
+`intel_atomic_dsb_finish()` (`:7338`, `:7359`, guarded by
+`if (use_flipq || use_dsb)` at `:7315`); for those the plane-update part of
+`intel_update_crtc()` only kicks off or queues the batch — it still does
+ancillary MMIO afterwards, e.g. `intel_vrr_dcb_increment_flip_count()` (`:6862`
+→ `intel_vrr.c:683`).
+
+For the direct-MMIO mechanism the *arming* writes happen inline, bracketed by
+`intel_pipe_update_start()`/`_end()`. The non-arming writes are earlier, in
+`intel_pre_update_crtc()` → `intel_crtc_planes_update_noarm()` (`:6813`),
+outside that bracket. The bracket is a true vblank-evasion window only for
+synchronous updates: for `do_async_flip`, `intel_pipe_update_start()` returns
+immediately after transferring `uapi.event` to `crtc->flip_done_event`
+(`intel_crtc.c:602-605`) and
+`intel_pipe_update_end()` jumps past the evasion bookkeeping
+(`intel_crtc.c:739-740`).
+
+**None of these three paths emits a frontbuffer notification.**
+`intel_frontbuffer_flip()` is not reached from `intel_update_crtc()` at all —
+it is a separate FBC/PSR/DRRS notification raised elsewhere in the tail (see
+below and §2.4).
 
 And `intel_post_plane_update()` (`:1037`) begins with the flip-flush:
 
@@ -616,10 +734,12 @@ already blocked on:
 * `drm_atomic_helper_wait_for_flip_done()` — `:7553`.
 
 So the *ordering* intuition is normally "after the flip has landed"; the
-*mechanism* is not a vblank handler. More precisely, the code has returned
-from the flip-done wait helpers: the helper can time out, and a
-`legacy_cursor_update` can complete its flip tracking immediately. The
-executing context is one of:
+*mechanism* is not a vblank handler, and the ordering guarantee is weaker than it
+looks. More precisely, the code has merely *returned from* the flip-done wait
+helpers: the helper can time out after 10 s (`drm_atomic_helper.c:1959-1962`), and
+for a `legacy_cursor_update` `drm_atomic_helper_setup_commit()` already completed
+`flip_done` up front (`drm_atomic_helper.c:2549-2553`), making the wait a no-op.
+The executing context is one of:
 
 1. the `i915_flip` workqueue worker (non-blocking non-modeset commit, `:7767`),
 2. the ordered `i915_modeset` workqueue worker (non-blocking modeset, `:7765`), or
@@ -633,7 +753,13 @@ to be a vblank worker but currently is not.
 Two more consequences:
 * `intel_crtc_disable_planes()` (`:1287-1313`) raises `ORIGIN_FLIP` on the *disable*
   side, nowhere near a successful flip — it is called from the modeset-disable
-  sequence and flushes the bits of planes that were visible and are being torn down.
+  sequence (`intel_commit_modeset_disables()` `:6908`, call site `:6935`, reached
+  from `:7486`) and flushes the bits of planes that were visible and are being torn
+  down together with the old CRTC configuration. It precedes `commit_modeset_enables`
+  (`:7537`) and therefore precedes the new enable/update sequence — though not
+  literally every hardware write in the tail: `intel_atomic_dsb_finish()`
+  (`:7445`) can already touch registers, e.g. `intel_pipedmc_dcb_disable(NULL, crtc)`
+  at `:7332`.
 * `i915_overlay.c:208` raises `ORIGIN_FLIP` from the legacy overlay old-vma release,
   completely outside the atomic machinery — and, on that path, potentially from a
   dma-fence signal callback: `overlay->last_flip` is initialised with flags `0`
@@ -679,12 +805,37 @@ intel_atomic_commit_tail()                                            :7423
   │ commit_modeset_disables                                           :7486
   │    └─ (modeset-disable route) intel_crtc_disable_planes()         :1287
   │           └─ intel_frontbuffer_flip(display, fb_bits)             :1312  ← ORIGIN_FLIP
-  │ commit_modeset_enables                                            :7537
+  │              (disable side: old planes/CRTC torn down, NOT a landed flip)
+  │ commit_modeset_enables  = display->modeset.funcs->                :7537
+  │    │    intel_commit_modeset_enables()  (pre-SKL vtables)         :6978
+  │    │    skl_commit_modeset_enables()    (SKL+, DDB-ordered)       :6999
+  │    ├─ intel_enable_crtc()                   :6987 / :7098 / :7116
+  │    ├─ intel_pre_update_crtc()                :6988 / :7037 / :7128
+  │    │     └─ intel_crtc_planes_update_noarm()  (non-DSB/non-FlipQ) :6813
+  │    └─ intel_update_crtc()              :6995 / :7060 / :7148 →    :6816
+  │          ├─ use_flipq  → intel_flipq_enable()                     :6825
+  │          │               intel_crtc_prepare_vblank_event()        :6827
+  │          │               intel_flipq_add(.., INTEL_DSB_0,
+  │          │                               dsb_commit)              :6829
+  │          ├─ use_dsb    → intel_crtc_prepare_vblank_event()        :6832
+  │          │               intel_dsb_commit(dsb_commit)             :6834
+  │          └─ else (direct MMIO; vblank evasion unless do_async_flip)
+  │                intel_pipe_update_start()                          :6837
+  │                intel_dsb_commit() if dsb_color                    :6840
+  │                commit_pipe_pre_planes()                           :6842
+  │                intel_crtc_planes_update_arm()                     :6844
+  │                commit_pipe_post_planes()                          :6846
+  │                intel_pipe_update_end()                            :6848
+  │          ^^ PROGRAMMING step — plane/pipe registers armed here.
+  │             No frontbuffer notification is emitted on this path.
   │ intel_wait_for_vblank_workers()                                   :7542
-  │ drm_atomic_helper_wait_for_flip_done()   <-- flip actually landed  :7553
+  │ drm_atomic_helper_wait_for_flip_done()   <-- wait RETURNS          :7553
+  │        (not proof of HW latch: 10 s timeout drm_atomic_helper.c:1959-1962;
+  │         legacy_cursor_update pre-completes flip_done :2549-2553)
   │ optimize watermarks                                               :7587
   ├─ intel_post_plane_update()                                        :7593 -> :1037
   │     └─ intel_frontbuffer_flip(display, new_crtc_state->fb_bits)   :1047  ← ORIGIN_FLIP
+  │              (post-plane-update NOTIFICATION, after the flip-done wait)
   │           ├─ busy_bits &= ~fb_bits        (stale CS bits dropped) fb.c:120
   │           └─ frontbuffer_flush(.., ORIGIN_FLIP)                   fb.c:123
   │                 ├─ bits &= ~busy_bits  (re-mask vs live GPU work) fb.c:89
@@ -1204,12 +1355,21 @@ t5  commit_tail reaches :7593/:1047 ----> ORIGIN_FLIP flush
    wait returns.** `intel_post_plane_update()` is called at `intel_display.c:7593`,
    after `intel_wait_for_vblank_workers()` (`:7542`) and
    `drm_atomic_helper_wait_for_flip_done()` (`:7553`), and before
-   `drm_atomic_helper_commit_hw_done()` (`:7623`). Two qualifications:
+   `drm_atomic_helper_commit_hw_done()` (`:7623`). Three qualifications:
    * the wait helper does not guarantee hardware completion — it times out after 10 s,
      logs `"flip_done timed out"` and continues (`drm_atomic_helper.c:1959-1962`);
+   * for `state->legacy_cursor_update` (and for CRTCs inactive both before and
+     after) `drm_atomic_helper_setup_commit()` already did
+     `complete_all(&commit->flip_done)` (`drm_atomic_helper.c:2549-2553` and
+     `:2544-2547`), so the wait returns immediately and proves nothing about the
+     hardware;
    * the **other** `ORIGIN_FLIP` site, `intel_crtc_disable_planes()` (`:1312`), is
-     reached from `intel_commit_modeset_disables()` (`:7486`) and therefore runs
-     *before* that wait.
+     reached from `intel_commit_modeset_disables()` (`:6908`, called at `:7486`,
+     call site `:6935`) and therefore runs *before* that wait. It notifies about
+     old planes being disabled during a modeset, not about a completed flip.
+     Note also that `commit_modeset_enables` (`:7537`) — the step that actually
+     programs the new plane/pipe registers through `intel_update_crtc()` (`:6816`)
+     — sits between the two, and emits no frontbuffer notification of its own.
 
 5. **Commits are serialised against each other by the workqueues and by the DRM core.**
    * Non-blocking modesets use the *ordered* `wq.modeset` (`intel_display_driver.c:232`)
@@ -1279,9 +1439,16 @@ t5  commit_tail reaches :7593/:1047 ----> ORIGIN_FLIP flush
    intel_atomic_commit_tail()        i915_vma.c:2011            │
        intel_display.c:7423          busy_bits |= bits          ▼
             │                        frontbuffer.c:132  intel_frontbuffer_queue_flush()
-            │ wait vblank workers :7542     │                frontbuffer.c:183
-            │ wait flip done      :7553     │                      │ schedule_work :189
-            │                               │                      ▼
+            │ commit_modeset_enables :7537  │                frontbuffer.c:183
+            │  └ intel_update_crtc  :6816   │                      │ schedule_work :189
+            │     flipq/dsb/mmio-arm        │                      │
+            │     (programming only,        │                      │
+            │      no notification)         │                      │
+            │ wait vblank workers :7542     │                      │
+            │ wait flip done      :7553     │                      │
+            │   (returns; not proof of      │                      │
+            │    HW latch — timeout /       │                      │
+            │    legacy_cursor_update)      │                      ▼
             ▼                     ┌─ GPU executes ─┐     intel_frontbuffer_flush_work()
    intel_post_plane_update()      │                │           frontbuffer.c:167
       intel_display.c:1037        │  rq fence      │                 │
@@ -1319,6 +1486,12 @@ t5  commit_tail reaches :7593/:1047 ----> ORIGIN_FLIP flush
 | Origin enum, inline wrappers | `drivers/gpu/drm/i915/display/intel_frontbuffer.h` |
 | Core invalidate/flush/flip/track | `drivers/gpu/drm/i915/display/intel_frontbuffer.c` |
 | Atomic commit + `intel_post_plane_update` | `drivers/gpu/drm/i915/display/intel_display.c` |
+| `commit_modeset_enables` vtable + `intel_update_crtc` | `intel_display.c:6816,6978,6999,7537,8212,8221` |
+| Vblank evasion window | `drivers/gpu/drm/i915/display/intel_crtc.c:587` (`_start`), `:726` (`_end`) |
+| Plane arm / noarm | `drivers/gpu/drm/i915/display/intel_plane.c:1073`, `:981` |
+| FlipQ submission | `drivers/gpu/drm/i915/display/intel_flipq.c:422` |
+| DSB batch kick-off / build | `drivers/gpu/drm/i915/display/intel_dsb.c:929`; built in `intel_display.c:7252-7421` |
+| Flip-done wait + its escapes | `drivers/gpu/drm/drm_atomic_helper.c:1944-1967`, `:2544-2553` |
 | Atomic ioctl dispatch | `drivers/gpu/drm/drm_ioctl.c:702` → `drm_atomic_uapi.c:1601` |
 | `fb_bits` accumulation | `drivers/gpu/drm/i915/display/intel_plane.c:724`, reset `intel_atomic.c:274` |
 | Workqueue creation | `drivers/gpu/drm/i915/display/intel_display_driver.c:226-255` |
